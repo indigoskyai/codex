@@ -266,7 +266,6 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
-    caller_manages_http_request_retries: bool,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -465,7 +464,6 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
-            caller_manages_http_request_retries: false,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -1080,10 +1078,6 @@ impl ModelClientSession {
         Arc::clone(&self.turn_state)
     }
 
-    pub(crate) fn use_caller_managed_http_request_retries(&mut self) {
-        self.caller_manages_http_request_retries = true;
-    }
-
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
@@ -1369,6 +1363,7 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
+        defer_server_overloaded_retries: bool,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.provider.auth_manager();
@@ -1417,15 +1412,13 @@ impl ModelClientSession {
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
-            let mut responses_api_provider = client_setup.api_provider;
-            if self.caller_manages_http_request_retries {
-                // Keep ordinary HTTP open failures in one outer request loop.
-                responses_api_provider.retry.retry_5xx = false;
-                responses_api_provider.retry.retry_transport = false;
-            }
-            let client =
-                ApiResponsesClient::new(transport, responses_api_provider, client_setup.api_auth)
-                    .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let client = ApiResponsesClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry))
+            .with_deferred_server_overload_retries(defer_server_overloaded_retries);
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
@@ -1751,6 +1744,33 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_with_deferred_server_overload_retries(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            false,
+            inference_trace,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_with_deferred_server_overload_retries(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        defer_server_overloaded_retries: bool,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -1786,6 +1806,7 @@ impl ModelClientSession {
                     summary,
                     service_tier,
                     responses_metadata,
+                    defer_server_overloaded_retries,
                     inference_trace,
                 )
                 .await
