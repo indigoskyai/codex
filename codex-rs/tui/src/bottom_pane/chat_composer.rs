@@ -2284,6 +2284,8 @@ impl ChatComposer {
     ///   second `@` in `@scope/pkg@latest`), keep treating the surrounding
     ///   whitespace-delimited token as the active token rather than starting a
     ///   new token at that nested prefix.
+    /// - For adjacent `$` skill mentions, a left-side mention fragment wins when
+    ///   the cursor is immediately before the next `$`.
     /// - If the token under the cursor starts with `prefix`, its byte range and
     ///   text without the leading prefix are returned. When `allow_empty` is
     ///   true, a lone prefix character yields `Some(String::new())` to surface hints.
@@ -2311,6 +2313,33 @@ impl ChatComposer {
         // Split the line around the (now safe) cursor position.
         let before_cursor = &text[..safe_cursor];
         let after_cursor = &text[safe_cursor..];
+        let prefix_len = prefix.len_utf8();
+
+        if prefix == '$' && allow_empty && after_cursor.starts_with(prefix) {
+            let left_fragment_start = before_cursor
+                .char_indices()
+                .rfind(|(_, c)| c.is_whitespace())
+                .map(|(idx, c)| idx + c.len_utf8())
+                .unwrap_or(0);
+            let left_fragment = &text[left_fragment_start..safe_cursor];
+            if left_fragment.starts_with(prefix) {
+                return Some((
+                    left_fragment_start..safe_cursor,
+                    left_fragment[prefix_len..].to_string(),
+                ));
+            }
+        }
+
+        if allow_empty && after_cursor.starts_with(prefix) && before_cursor.ends_with(prefix) {
+            let left_prefix_start = safe_cursor.saturating_sub(prefix_len);
+            let left_prefix_starts_token = text[..left_prefix_start]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace);
+            if left_prefix_starts_token {
+                return Some((left_prefix_start..safe_cursor, String::new()));
+            }
+        }
 
         // Detect whether we're on whitespace at the cursor boundary.
         let at_whitespace = if safe_cursor < text.len() {
@@ -2323,28 +2352,35 @@ impl ChatComposer {
             false
         };
 
-        // Left candidate: token containing the cursor position.
-        let start_left = before_cursor
+        // Left candidate: token containing the cursor position. When the cursor is on separator
+        // whitespace, use the token immediately to the left of the same-line whitespace run.
+        let end_left = if at_whitespace {
+            before_cursor
+                .trim_end_matches(Self::is_horizontal_whitespace)
+                .len()
+        } else {
+            let end_left_rel = after_cursor
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(idx, _)| idx)
+                .unwrap_or(after_cursor.len());
+            safe_cursor + end_left_rel
+        };
+        let start_left = text[..end_left]
             .char_indices()
             .rfind(|(_, c)| c.is_whitespace())
             .map(|(idx, c)| idx + c.len_utf8())
             .unwrap_or(0);
-        let end_left_rel = after_cursor
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(idx, _)| idx)
-            .unwrap_or(after_cursor.len());
-        let end_left = safe_cursor + end_left_rel;
         let token_left = if start_left < end_left {
             Some(&text[start_left..end_left])
         } else {
             None
         };
 
-        // Right candidate: token immediately after any whitespace from the cursor.
+        // Right candidate: token immediately after any same-line whitespace from the cursor.
         let ws_len_right: usize = after_cursor
             .chars()
-            .take_while(|c| c.is_whitespace())
+            .take_while(|c| Self::is_horizontal_whitespace(*c))
             .map(char::len_utf8)
             .sum();
         let start_right = safe_cursor + ws_len_right;
@@ -2364,19 +2400,15 @@ impl ChatComposer {
         let left_match = token_left.filter(|t| t.starts_with(prefix));
         let right_match = token_right.filter(|t| t.starts_with(prefix));
 
-        let left_prefixed =
-            left_match.map(|t| (start_left..end_left, t[prefix.len_utf8()..].to_string()));
+        let left_prefixed = left_match.map(|t| (start_left..end_left, t[prefix_len..].to_string()));
         let right_prefixed =
-            right_match.map(|t| (start_right..end_right, t[prefix.len_utf8()..].to_string()));
+            right_match.map(|t| (start_right..end_right, t[prefix_len..].to_string()));
 
         if at_whitespace {
-            if right_prefixed.is_some() {
+            if token_left.is_some_and(|t| t == prefix_str) && !allow_empty {
                 return right_prefixed;
             }
-            if token_left.is_some_and(|t| t == prefix_str) {
-                return allow_empty.then(|| (start_left..end_left, String::new()));
-            }
-            return left_prefixed;
+            return left_prefixed.or(right_prefixed);
         }
         if after_cursor.starts_with(prefix) {
             let prefix_starts_token = before_cursor
@@ -2407,12 +2439,17 @@ impl ChatComposer {
         Self::current_prefixed_token(textarea, '@', /*allow_empty*/ false)
     }
 
-    fn current_editable_at_token_range_with_options(
+    /// Returns the active prefixed token only when its sigil and name remain editable plaintext.
+    ///
+    /// Atomic elements and tokens whose mention prefix is already atomic are excluded so bound
+    /// mentions are not offered for completion again.
+    fn current_editable_prefixed_token_range(
         &self,
+        prefix: char,
         allow_empty: bool,
     ) -> Option<(Range<usize>, String)> {
         let (range, token) =
-            Self::current_prefixed_token_range(&self.draft.textarea, '@', allow_empty)?;
+            Self::current_prefixed_token_range(&self.draft.textarea, prefix, allow_empty)?;
         if self
             .draft
             .textarea
@@ -2427,7 +2464,7 @@ impl ChatComposer {
             .iter()
             .take_while(|byte| is_mention_name_char(**byte))
             .count();
-        let mention_end = range.start + '@'.len_utf8() + name_len;
+        let mention_end = range.start + prefix.len_utf8() + name_len;
         if name_len > 0
             && mention_end < range.end
             && ends_plaintext_at_mention(self.draft.textarea.text().as_bytes(), mention_end)
@@ -2441,6 +2478,13 @@ impl ChatComposer {
         }
 
         Some((range, token))
+    }
+
+    fn current_editable_at_token_range_with_options(
+        &self,
+        allow_empty: bool,
+    ) -> Option<(Range<usize>, String)> {
+        self.current_editable_prefixed_token_range('@', allow_empty)
     }
 
     fn current_editable_at_token_with_options(&self, allow_empty: bool) -> Option<String> {
@@ -2468,7 +2512,7 @@ impl ChatComposer {
         if !self.mentions_enabled() {
             return None;
         }
-        Self::current_prefixed_token_range(&self.draft.textarea, '$', /*allow_empty*/ true)
+        self.current_editable_prefixed_token_range('$', /*allow_empty*/ true)
     }
 
     /// Replace the active `@token` (the one under the cursor) with `path`.
@@ -6273,6 +6317,157 @@ mod tests {
         assert_eq!(mention.path, Some("plugin://sample@test".to_string()));
     }
 
+    fn configure_partially_bound_skill_mentions(composer: &mut ChatComposer) {
+        let bound_skill_path = test_path_buf("/tmp/bound-skill/SKILL.md").abs();
+        composer.set_skill_mentions(Some(vec![SkillMetadata {
+            name: "unbound-skill".to_string(),
+            description: "Example skill used in tests.".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: test_path_buf("/tmp/unbound-skill/SKILL.md").abs(),
+            scope: crate::test_support::skill_scope_user(),
+            plugin_id: None,
+        }]));
+
+        composer.set_text_content_with_mention_bindings(
+            "$unbound-skill  $bound-skill continue".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![MentionBinding {
+                sigil: '$',
+                mention: "bound-skill".to_string(),
+                path: bound_skill_path.display().to_string(),
+            }],
+        );
+        composer.draft.textarea.set_cursor("$unbound-skill ".len());
+        composer.sync_popups();
+    }
+
+    #[test]
+    fn skill_popup_targets_unbound_mention_left_of_bound_mention() {
+        let (mut composer, _rx) = new_test_composer();
+        configure_partially_bound_skill_mentions(&mut composer);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            composer.current_text(),
+            "$unbound-skill  $bound-skill continue"
+        );
+        assert_eq!(
+            composer.mention_bindings(),
+            vec![
+                MentionBinding {
+                    sigil: '$',
+                    mention: "unbound-skill".to_string(),
+                    path: test_path_buf("/tmp/unbound-skill/SKILL.md")
+                        .abs()
+                        .display()
+                        .to_string(),
+                },
+                MentionBinding {
+                    sigil: '$',
+                    mention: "bound-skill".to_string(),
+                    path: test_path_buf("/tmp/bound-skill/SKILL.md")
+                        .abs()
+                        .display()
+                        .to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skill_completion_advances_past_existing_separator() {
+        let (mut composer, _rx) = new_test_composer();
+        configure_partially_bound_skill_mentions(&mut composer);
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        composer.insert_str("foo");
+
+        assert_eq!(
+            composer.current_text(),
+            "$unbound-skill foo $bound-skill continue"
+        );
+    }
+
+    #[test]
+    fn skill_completion_does_not_dismiss_identical_next_mention() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_skill_mentions(Some(vec![SkillMetadata {
+            name: "skill".to_string(),
+            description: "Example skill used in tests.".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: test_path_buf("/tmp/skill/SKILL.md").abs(),
+            scope: crate::test_support::skill_scope_user(),
+            plugin_id: None,
+        }]));
+        composer.set_text_content("$skill $skill".to_string(), Vec::new(), Vec::new());
+        composer.draft.textarea.set_cursor("$skill".len());
+        composer.sync_popups();
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(composer.draft.textarea.cursor(), "$skill ".len());
+        assert!(matches!(composer.popups.active, ActivePopup::Skill(_)));
+    }
+
+    #[test]
+    fn typing_skill_prefix_before_existing_skill_starts_new_mention() {
+        for inserted in ["$", "$r"] {
+            let (mut composer, _rx) = new_test_composer();
+            let rustdoc_path = test_path_buf("/tmp/rustdoc/SKILL.md").abs();
+            composer.set_skill_mentions(Some(vec![SkillMetadata {
+                name: "rustdoc".to_string(),
+                description: "Add focused RustDoc comments.".to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                policy: None,
+                path_to_skills_md: rustdoc_path.clone(),
+                scope: crate::test_support::skill_scope_user(),
+                plugin_id: None,
+            }]));
+            composer.set_text_content("$simplify-code".to_string(), Vec::new(), Vec::new());
+            composer.draft.textarea.set_cursor(/*pos*/ 0);
+
+            composer.insert_str(inserted);
+
+            let ActivePopup::Skill(popup) = &composer.popups.active else {
+                panic!("expected skill popup for new mention fragment {inserted:?}");
+            };
+            let mention = popup
+                .selected_mention()
+                .expect("expected skill mention to be selected");
+            assert_eq!(mention.insert_text, "$rustdoc".to_string());
+
+            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+            assert_eq!(composer.current_text(), "$rustdoc $simplify-code");
+            assert_eq!(
+                composer.mention_bindings(),
+                vec![MentionBinding {
+                    sigil: '$',
+                    mention: "rustdoc".to_string(),
+                    path: rustdoc_path.display().to_string(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn skill_popup_targets_unbound_mention_left_of_bound_mention_snapshot() {
+        snapshot_composer_state(
+            "skill_popup_targets_unbound_mention_left_of_bound_mention",
+            /*enhanced_keys_supported*/ false,
+            configure_partially_bound_skill_mentions,
+        );
+    }
+
     #[test]
     fn set_skill_mentions_refreshes_open_mention_popup() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
@@ -6698,6 +6893,44 @@ mod tests {
             assert_eq!(
                 result, expected,
                 "Failed for whitespace boundary case: {description} - input: '{input}', cursor: {cursor_pos}",
+            );
+        }
+    }
+
+    #[test]
+    fn current_prefixed_token_affinity_does_not_cross_line_break() {
+        for (text, prefix, allow_empty) in [
+            ("@file\n  continue", '@', false),
+            ("continue  \n@file", '@', false),
+            ("$skill\n  continue", '$', true),
+            ("continue  \n$skill", '$', true),
+        ] {
+            let mut textarea = TextArea::new();
+            textarea.insert_str(text);
+            textarea.set_cursor(text.find("  ").expect("indentation present") + 1);
+
+            assert_eq!(
+                ChatComposer::current_prefixed_token_range(&textarea, prefix, allow_empty),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn current_prefixed_token_prefers_lone_prefix_before_adjacent_token() {
+        for (text, cursor, expected_query) in [
+            ("$$simplify-code", "$".len(), ""),
+            ("$r$simplify-code", "$r".len(), "r"),
+        ] {
+            let mut textarea = TextArea::new();
+            textarea.insert_str(text);
+            textarea.set_cursor(cursor);
+
+            assert_eq!(
+                ChatComposer::current_prefixed_token_range(
+                    &textarea, '$', /*allow_empty*/ true
+                ),
+                Some((0..cursor, expected_query.to_string()))
             );
         }
     }
@@ -9106,6 +9339,21 @@ mod tests {
     }
 
     #[test]
+    fn file_completion_advances_past_existing_separator() {
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@ma  next",
+            /*cursor*/ "@ma ".len(),
+            "ma",
+            PathBuf::from("src/main.rs"),
+        );
+        composer.insert_str("foo");
+
+        assert_eq!(composer.current_text(), "src/main.rs foo next");
+    }
+
+    #[test]
     fn file_completion_preserves_separator_before_existing_suffix() {
         let (mut composer, _rx) = new_test_composer();
         complete_file(
@@ -9172,6 +9420,28 @@ mod tests {
         composer.sync_popups();
 
         assert!(matches!(composer.popups.active, ActivePopup::File(_)));
+    }
+
+    #[test]
+    fn image_completion_advances_past_existing_separator() {
+        let tmp = tempdir().expect("create TempDir");
+        let image_path = tmp.path().join("image.png");
+        let image: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(3, 2, |_x, _y| Rgba([1, 2, 3, 255]));
+        image.save(&image_path).expect("write temp png");
+
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@image  next",
+            /*cursor*/ "@image ".len(),
+            "image",
+            image_path.clone(),
+        );
+        composer.insert_str("foo");
+
+        assert_eq!(composer.current_text(), "[Image #1] foo next");
+        assert_eq!(composer.local_image_paths(), vec![image_path]);
     }
 
     /// Behavior: multiple paste operations can coexist; placeholders should be expanded to their
